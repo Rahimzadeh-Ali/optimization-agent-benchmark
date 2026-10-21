@@ -34,6 +34,7 @@ class CocoProblem(BenchmarkProblem):
         self.suite_name = suite_name
         self.function_id = function_id
         self.instance = instance
+        self._coco_dimension = dimension
         self._cocoex = cocoex
         self._suite = cocoex.Suite(suite_name, "", "")
         self._problem = self._suite.get_problem_by_function_dimension_instance(
@@ -94,7 +95,19 @@ class CocoProblem(BenchmarkProblem):
 
     def _reset_backend(self, seed: int | None) -> None:
         del seed
-        self._problem.reset()
+        reset = getattr(self._problem, "reset", None)
+        if callable(reset):
+            reset()
+            return
+        # coco-experiment 2.8.2 does not expose Problem.reset().  Recreating
+        # the suite/problem is the supported way to obtain fresh counters and
+        # a fresh noisy-function state when a wrapper is reused.
+        self._suite = self._cocoex.Suite(self.suite_name, "", "")
+        self._problem = self._suite.get_problem_by_function_dimension_instance(
+            self.function_id, self._coco_dimension, self.instance
+        )
+        if self._problem is None:
+            raise RuntimeError("COCO could not recreate the benchmark problem.")
 
 
 def make_bbob(problem_id: str, function_id: int, dimension: int, budget: int, direction: str, name: str) -> CocoProblem:

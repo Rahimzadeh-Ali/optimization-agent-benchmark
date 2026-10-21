@@ -79,6 +79,35 @@ def discover_runs(root: str | Path) -> list[RunArtifact]:
     return runs
 
 
+def _latest_unique_runs(runs: list[RunArtifact]) -> tuple[list[RunArtifact], int]:
+    """Keep only the latest completed artifact for each campaign key.
+
+    A resumed campaign can leave more than one successful directory for the
+    same problem, optimizer, and seed.  Treating those directories as separate
+    seeds would give the duplicate campaign extra statistical weight.
+    """
+    latest: dict[tuple[str, str, int], RunArtifact] = {}
+    for run in runs:
+        key = (
+            str(run.summary.get("problem_id", "")),
+            str(run.summary.get("optimizer", "")),
+            int(run.summary.get("seed", 0)),
+        )
+        previous = latest.get(key)
+        ordering = (str(run.summary.get("finished_at", "")), str(run.summary_path))
+        if previous is None:
+            latest[key] = run
+            continue
+        previous_ordering = (
+            str(previous.summary.get("finished_at", "")),
+            str(previous.summary_path),
+        )
+        if ordering > previous_ordering:
+            latest[key] = run
+    selected = sorted(latest.values(), key=lambda run: str(run.summary_path))
+    return selected, len(runs) - len(selected)
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -141,6 +170,21 @@ def _trajectory(run: RunArtifact) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         objectives.append(best_objective if np.isfinite(best_objective) else np.nan)
         violations.append(best_violation if np.isfinite(best_violation) else np.nan)
     return np.asarray(indices), np.asarray(objectives), np.asarray(violations)
+
+
+def _regret_trajectory(run: RunArtifact) -> tuple[np.ndarray, np.ndarray, str]:
+    indices, objectives, _ = _trajectory(run)
+    reference_data = run.summary.get("regret_reference", {})
+    reference = reference_data.get("objective")
+    kind = str(reference_data.get("kind", "run_best"))
+    if reference is None:
+        finite = objectives[np.isfinite(objectives)]
+        reference = float(np.min(finite)) if len(finite) else 0.0
+        kind = "run_best"
+    regrets = objectives - float(reference)
+    # Numerical noise and stochastic observations may cross a latent reference.
+    regrets = np.where(np.isfinite(regrets), np.maximum(regrets, 1.0e-12), np.nan)
+    return indices, regrets, kind
 
 
 def _aggregate_series(
@@ -251,6 +295,124 @@ def plot_problem_convergence(runs: list[RunArtifact], output: Path) -> None:
         fontsize=8, color=TEXT_MUTED,
     )
     figure.tight_layout(rect=(0, 0.03, 0.86, 1))
+    figure.savefig(output, bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_problem_regret(runs: list[RunArtifact], output: Path) -> None:
+    plt = _matplotlib()
+    problem_id = str(runs[0].summary["problem_id"])
+    figure, axis = plt.subplots(figsize=(10.5, 5.8), dpi=150)
+    kinds: set[str] = set()
+    any_regret = False
+    for color_index, (optimizer, optimizer_runs) in enumerate(_group_by_optimizer(runs).items()):
+        color = PALETTE[color_index % len(PALETTE)]
+        trajectories = [_regret_trajectory(run) for run in optimizer_runs]
+        kinds.update(item[2] for item in trajectories)
+        max_index = max((int(item[0][-1]) for item in trajectories if len(item[0])), default=0)
+        matrix = np.full((len(trajectories), max_index), np.nan)
+        for row, (indices, regrets, _) in enumerate(trajectories):
+            if len(indices):
+                matrix[row, indices.astype(int) - 1] = regrets
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            median = np.nanmedian(matrix, axis=0)
+            lower = np.nanpercentile(matrix, 25, axis=0)
+            upper = np.nanpercentile(matrix, 75, axis=0)
+        x = np.arange(1, max_index + 1)
+        finite = np.isfinite(median)
+        if finite.any():
+            any_regret = True
+            axis.plot(x[finite], median[finite], color=color, linewidth=2.0, label=optimizer)
+        axis.fill_between(
+            x,
+            lower,
+            upper,
+            where=np.isfinite(lower) & np.isfinite(upper),
+            color=color,
+            alpha=0.14,
+            linewidth=0,
+        )
+    if any_regret:
+        axis.set_yscale("log")
+    else:
+        axis.text(
+            0.5,
+            0.5,
+            "No feasible regret trajectory was observed.",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            color=TEXT_MUTED,
+        )
+    axis.set_xlabel("Evaluation")
+    axis.set_ylabel("Best feasible regret")
+    axis.set_title(f"{problem_id}: iteration vs regret", loc="left", fontsize=13, pad=12)
+    handles, labels = axis.get_legend_handles_labels()
+    if handles:
+        axis.legend(handles, labels, frameon=False)
+    _style_axis(axis)
+    figure.text(
+        0.01,
+        0.01,
+        "Reference type: " + ", ".join(sorted(kinds)) + ". Regret is clipped at 1e-12 for log display.",
+        fontsize=8,
+        color=TEXT_MUTED,
+    )
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
+    figure.savefig(output, bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_suite_regret_dashboard(
+    by_problem: dict[str, list[RunArtifact]], output: Path
+) -> None:
+    plt = _matplotlib()
+    ordered = sorted(by_problem, key=_problem_sort_key)
+    figure, axes = plt.subplots(6, 5, figsize=(18, 19), dpi=150)
+    for axis, problem_id in zip(axes.flat, ordered):
+        runs = by_problem[problem_id]
+        any_regret = False
+        for color_index, (optimizer, optimizer_runs) in enumerate(_group_by_optimizer(runs).items()):
+            color = PALETTE[color_index % len(PALETTE)]
+            for run in optimizer_runs:
+                x, regret, _ = _regret_trajectory(run)
+                finite = np.isfinite(regret)
+                if finite.any():
+                    any_regret = True
+                    axis.plot(x[finite], regret[finite], color=color, linewidth=1.35, alpha=0.9)
+            axis.text(
+                0.98,
+                0.96,
+                optimizer,
+                transform=axis.transAxes,
+                ha="right",
+                va="top",
+                fontsize=6.5,
+                color=TEXT_MUTED,
+            )
+        if any_regret:
+            axis.set_yscale("log")
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No valid\nregret",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7,
+                color=TEXT_MUTED,
+            )
+        axis.set_title(problem_id, loc="left", fontsize=10, pad=4)
+        axis.tick_params(labelsize=7)
+        _style_axis(axis)
+    for axis in axes[-1, :]:
+        axis.set_xlabel("Evaluation", fontsize=8)
+    for axis in axes[:, 0]:
+        axis.set_ylabel("Regret", fontsize=8)
+    figure.suptitle("SOTA optimizer profiles: iteration versus regret", fontsize=17, y=0.995)
+    figure.tight_layout(rect=(0, 0, 1, 0.988))
     figure.savefig(output, bbox_inches="tight")
     plt.close(figure)
 
@@ -404,7 +566,8 @@ def visualize_results(
 ) -> dict[str, Any]:
     """Create GitHub-style comparison figures from persisted campaign artifacts."""
     discovered = discover_runs(input_root)
-    completed = [run for run in discovered if run.summary.get("status") == "completed"]
+    completed_all = [run for run in discovered if run.summary.get("status") == "completed"]
+    completed, duplicates_ignored = _latest_unique_runs(completed_all)
     if not completed:
         raise ValueError(f"No completed campaign summaries found under {Path(input_root).resolve()}.")
 
@@ -424,18 +587,24 @@ def visualize_results(
         problem_dir = output_root / problem_id
         problem_dir.mkdir(parents=True, exist_ok=True)
         convergence = problem_dir / "convergence.png"
+        regret = problem_dir / "regret_profile.png"
         final = problem_dir / "final_performance.png"
         plot_problem_convergence(by_problem[problem_id], convergence)
+        plot_problem_regret(by_problem[problem_id], regret)
         plot_problem_final(by_problem[problem_id], final)
-        generated.extend([str(convergence), str(final)])
+        generated.extend([str(convergence), str(regret), str(final)])
 
     heatmap = output_root / "suite_rank_heatmap.png"
     plot_suite_rank_heatmap(selected, heatmap)
     generated.append(str(heatmap))
+    dashboard = output_root / "iteration_vs_regret.png"
+    plot_suite_regret_dashboard(by_problem, dashboard)
+    generated.append(str(dashboard))
     manifest = {
         "input_root": str(Path(input_root).resolve()),
         "output_root": str(output_root),
         "discovered_summaries": len(discovered),
+        "duplicate_completed_runs_ignored": duplicates_ignored,
         "completed_runs_visualized": len(selected),
         "problem_ids": sorted(by_problem, key=_problem_sort_key),
         "generated_files": generated,
@@ -443,6 +612,7 @@ def visualize_results(
             "objective": "best feasible and lower-level-valid objective",
             "aggregation": "median and interquartile range across seeds",
             "suite_comparison": "within-task ranks; raw objectives are never compared across tasks",
+            "regret": "best valid objective minus exact, published, empirical, or run-best reference",
         },
     }
     manifest_path = output_root / "plot_manifest.json"

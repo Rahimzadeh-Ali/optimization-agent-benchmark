@@ -15,10 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 coco = ["coco-experiment==2.8.2"]
-cec = ["opfunu==1.0.1"]
+cec = ["opfunu==1.0.1", "setuptools<81"]
 constraints = ["pymoo==0.6.1.6"]
 nevergrad = ["nevergrad==1.0.12"]
 yahpo = ["yahpo-gym==1.0.2", "ConfigSpace<1", "onnxruntime>=1.17"]
+hpo = ["smac==2.4.1", "ConfigSpace==1.2.2"]
 optimizers = [
   "cma>=4.0",
   "scikit-optimize>=0.10",
@@ -31,6 +32,7 @@ visualization = ["matplotlib>=3.8"]
 full = [
   "coco-experiment==2.8.2",
   "opfunu==1.0.1",
+  "setuptools<81",
   "pymoo==0.6.1.6",
   "nevergrad==1.0.12",
   "yahpo-gym==1.0.2",

@@ -7,4 +7,8 @@ __pycache__/
 htmlcov/
 results/
 .smoke-results/
+.adapter-smoke/
+.all-sota-smoke*/
+.sota-smoke*/
+.numbered-smoke/
 external/yahpo_data/

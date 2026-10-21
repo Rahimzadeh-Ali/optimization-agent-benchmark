@@ -8,7 +8,7 @@ from optbench.registry import create_problem
     ("problem_id", "xu", "expected"),
     [
         ("B01", np.array([0.0, 0.0]), 0.0),
-        ("B02", np.array([0.0, 1.0]), 0.0),
+        ("B02", np.array([0.0, 0.0]), 0.0),
         ("B03", np.array([0.0, 0.0]), 0.0),
     ],
 )

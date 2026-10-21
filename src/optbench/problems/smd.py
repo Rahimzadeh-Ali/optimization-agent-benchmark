@@ -50,7 +50,10 @@ class SMDProblem(BilevelProblem):
         elif self.variant == 3:
             l1, l2 = float(xl[0]), float(xl[1])
             coupling = (u2**2 - np.tan(l2)) ** 2
-            upper = u1**2 + l1**2 + (u2 - 1.0) ** 2 + coupling
+            # Official SMD3 equation (10): F3 = u2^2 + (u2^2 - tan(l2))^2.
+            # The previous `(u2 - 1)^2` term moved the global optimum from
+            # xu=(0, 0) to xu=(0, 1), defining a different problem.
+            upper = u1**2 + l1**2 + u2**2 + coupling
             lower = u1**2 + 1.0 + l1**2 - np.cos(2.0 * np.pi * l1) + coupling
         else:
             q_value = float(xl[0])

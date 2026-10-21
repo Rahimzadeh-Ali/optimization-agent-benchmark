@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from tempfile import TemporaryDirectory
+from typing import Any, Callable
 
 import numpy as np
 from scipy.optimize import differential_evolution, minimize
 from scipy.stats import qmc
 
-from optbench.base import BackendUnavailable, BenchmarkProblem, BilevelProblem, BudgetExceeded
+from optbench.base import (
+    BackendUnavailable,
+    BenchmarkProblem,
+    BilevelProblem,
+    BudgetExceeded,
+    EvaluationResult,
+)
 
 
 Objective = Callable[[np.ndarray], float]
+ProblemEvaluator = Callable[[Any], EvaluationResult]
+ProblemRunner = Callable[[BenchmarkProblem, ProblemEvaluator, int, int], Any | None]
 
 
 @dataclass(frozen=True)
@@ -18,6 +27,7 @@ class OptimizerSpec:
     name: str
     description: str
     runner: Callable[[Objective, np.ndarray, int, int], None] | None
+    problem_runner: ProblemRunner | None = None
 
 
 def _random_search(objective: Objective, bounds: np.ndarray, budget: int, seed: int) -> None:
@@ -106,6 +116,205 @@ def _bobyqa(objective: Objective, bounds: np.ndarray, budget: int, seed: int) ->
         maxfun=budget,
         do_logging=False,
     )
+
+
+def _nevergrad_continuous(name: str) -> ProblemRunner:
+    def run(
+        problem: BenchmarkProblem,
+        evaluate: ProblemEvaluator,
+        budget: int,
+        seed: int,
+    ) -> Any:
+        try:
+            import nevergrad as ng
+        except ImportError as exc:
+            raise BackendUnavailable(
+                "Nevergrad SOTA methods require `python -m pip install -e \".[nevergrad]\"`."
+            ) from exc
+        assert problem.bounds is not None
+        parametrization = ng.p.Array(
+            init=np.mean(problem.bounds, axis=1)
+        ).set_bounds(problem.bounds[:, 0], problem.bounds[:, 1])
+        parametrization.random_state.seed(seed)
+        optimizer_class = getattr(ng.optimizers, name)
+        optimizer = optimizer_class(parametrization=parametrization, budget=budget, num_workers=1)
+        for _ in range(budget):
+            candidate = optimizer.ask()
+            result = evaluate(np.asarray(candidate.value, dtype=float))
+            value = result.objective if result.feasible else (
+                1.0e12 + 1.0e6 * result.constraint_violation
+            )
+            optimizer.tell(candidate, float(value))
+        return np.asarray(optimizer.provide_recommendation().value, dtype=float)
+
+    return run
+
+
+def _nevergrad_mixed(
+    problem: BenchmarkProblem,
+    evaluate: ProblemEvaluator,
+    budget: int,
+    seed: int,
+) -> Any:
+    try:
+        import nevergrad as ng
+    except ImportError as exc:
+        raise BackendUnavailable(
+            "Nevergrad mixed optimization requires `python -m pip install -e \".[nevergrad]\"`."
+        ) from exc
+    assert problem.bounds is not None
+    parameters = []
+    for variable_type, (lower, upper) in zip(problem.variable_types, problem.bounds):
+        scalar = ng.p.Scalar(lower=float(lower), upper=float(upper))
+        if variable_type in {"integer", "binary", "discrete"}:
+            scalar.set_integer_casting()
+        parameters.append(scalar)
+    parametrization = ng.p.Tuple(*parameters)
+    parametrization.random_state.seed(seed)
+    optimizer = ng.optimizers.PortfolioDiscreteOnePlusOne(
+        parametrization=parametrization,
+        budget=budget,
+        num_workers=1,
+    )
+    for _ in range(budget):
+        candidate = optimizer.ask()
+        x = np.asarray(candidate.value, dtype=float)
+        result = evaluate(x)
+        optimizer.tell(candidate, float(result.objective))
+    return np.asarray(optimizer.provide_recommendation().value, dtype=float)
+
+
+def _smac_hpo(
+    problem: BenchmarkProblem,
+    evaluate: ProblemEvaluator,
+    budget: int,
+    seed: int,
+) -> Any:
+    try:
+        from smac import HyperparameterOptimizationFacade, Scenario
+    except ImportError as exc:
+        raise BackendUnavailable(
+            "SMAC HPO requires `python -m pip install -e \".[hpo]\"`."
+        ) from exc
+
+    def target(configuration: Any, seed: int = seed) -> float:
+        del seed
+        values = dict(configuration)
+        values = {key: value for key, value in values.items() if key in problem._variable_names}
+        return float(evaluate(values).objective)
+
+    with TemporaryDirectory(prefix="optbench-smac-") as directory:
+        scenario = Scenario(
+            problem._space,
+            deterministic=True,
+            n_trials=budget,
+            seed=seed,
+            output_directory=directory,
+        )
+        # Keep the official SMAC HPO pipeline while scaling its overhead to a
+        # cheap 2,000-query surrogate benchmark.  The defaults search 10,000
+        # acquisition challengers and refit every eight suggestions, which can
+        # cost far more than the YAHPO objective itself.
+        acquisition_maximizer = HyperparameterOptimizationFacade.get_acquisition_maximizer(
+            scenario,
+            challengers=1024,
+            local_search_iterations=5,
+        )
+        config_selector = HyperparameterOptimizationFacade.get_config_selector(
+            scenario,
+            retrain_after=32,
+        )
+        optimizer = HyperparameterOptimizationFacade(
+            scenario,
+            target,
+            acquisition_maximizer=acquisition_maximizer,
+            config_selector=config_selector,
+            overwrite=True,
+            logging_level=False,
+        )
+        incumbent = optimizer.optimize()
+    values = dict(incumbent)
+    return {key: value for key, value in values.items() if key in problem._variable_names}
+
+
+def _pymoo_isres(
+    problem: BenchmarkProblem,
+    evaluate: ProblemEvaluator,
+    budget: int,
+    seed: int,
+) -> Any:
+    try:
+        import pymoo.algorithms.soo.nonconvex.sres as sres_module
+        from pymoo.algorithms.soo.nonconvex.isres import ISRES
+        from pymoo.core.problem import ElementwiseProblem
+        from pymoo.functions import FunctionLoader
+        from pymoo.optimize import minimize as pymoo_minimize
+    except ImportError as exc:
+        raise BackendUnavailable(
+            "ISRES requires `python -m pip install -e \".[constraints]\"`."
+        ) from exc
+    assert problem.bounds is not None
+
+    class WrappedProblem(ElementwiseProblem):
+        def __init__(self) -> None:
+            super().__init__(
+                n_var=problem.dimension,
+                n_obj=1,
+                n_ieq_constr=problem.number_of_constraints,
+                xl=problem.bounds[:, 0],
+                xu=problem.bounds[:, 1],
+            )
+
+        def _evaluate(self, x: np.ndarray, out: dict[str, Any], *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            result = evaluate(np.asarray(x, dtype=float))
+            out["F"] = result.objective
+            out["G"] = np.asarray(result.constraints, dtype=float)
+
+    # ISRES requires at least two offspring per parent.  A compact population
+    # leaves enough stochastic-ranking generations inside the fixed 2,000-call
+    # benchmark budget (large default populations can spend the whole budget
+    # before reaching the narrow feasible region of G7).  Complete generations
+    # still fit exactly inside the external accounting limit.
+    if budget < 6:
+        rng = np.random.default_rng(seed)
+        recommendation = None
+        for _ in range(budget):
+            recommendation = rng.uniform(problem.bounds[:, 0], problem.bounds[:, 1])
+            evaluate(recommendation)
+        return recommendation
+    population = min(20, budget // 3)
+    generations = max(1, (budget // population - 1) // 2)
+    isres_budget = population * (1 + 2 * generations)
+    # pymoo 0.6.1.6's Windows Cython extension is not NumPy-2 compatible
+    # (C long versus long-long index buffers).  The official pure-Python
+    # implementation is algorithmically identical and portable.
+    loader = FunctionLoader.get_instance()
+    previous_mode = loader.mode
+    previous_sres_loader = sres_module.load_function
+    loader.mode = "python"
+    sres_module.load_function = lambda name: loader.load(name, mode="python")
+    try:
+        result = pymoo_minimize(
+            WrappedProblem(),
+            ISRES(pop_size=population, n_offsprings=2 * population),
+            termination=("n_eval", isres_budget),
+            # pymoo's setup path treats integer zero as an unset/falsy seed.
+            # Offset the public benchmark seed so seed=0 stays reproducible.
+            seed=seed + 1,
+            verbose=False,
+        )
+    finally:
+        sres_module.load_function = previous_sres_loader
+        loader.mode = previous_mode
+    recommendation = None if result.X is None else np.asarray(result.X, dtype=float)
+    rng = np.random.default_rng(seed + 1)
+    for _ in range(budget - isres_budget):
+        candidate = rng.uniform(problem.bounds[:, 0], problem.bounds[:, 1])
+        evaluate(candidate)
+        if recommendation is None:
+            recommendation = candidate
+    return recommendation
 
 
 def _gp_bo(objective: Objective, bounds: np.ndarray, budget: int, seed: int) -> None:
@@ -205,6 +414,29 @@ OPTIMIZERS: dict[str, OptimizerSpec] = {
     "nelder_mead": OptimizerSpec("nelder_mead", "Adaptive Nelder-Mead", _local("Nelder-Mead")),
     "lbfgsb": OptimizerSpec("lbfgsb", "L-BFGS-B", _local("L-BFGS-B")),
     "nested_random": OptimizerSpec("nested_random", "Nested random search for bilevel tasks", None),
+    "ngopt": OptimizerSpec(
+        "ngopt", "Nevergrad adaptive NGOpt portfolio", None,
+        _nevergrad_continuous("NGOpt"),
+    ),
+    "tbpsa": OptimizerSpec(
+        "tbpsa", "Nevergrad noise-specialist TBPSA", None,
+        _nevergrad_continuous("TBPSA"),
+    ),
+    "ng_mixed_portfolio": OptimizerSpec(
+        "ng_mixed_portfolio", "Nevergrad mixed/discrete portfolio", None,
+        _nevergrad_mixed,
+    ),
+    "smac_hpo": OptimizerSpec(
+        "smac_hpo", "SMAC model-based hyperparameter optimization", None,
+        _smac_hpo,
+    ),
+    "pymoo_isres": OptimizerSpec(
+        "pymoo_isres", "pymoo improved stochastic ranking", None,
+        _pymoo_isres,
+    ),
+    "source_bilevel": OptimizerSpec(
+        "source_bilevel", "Source-structured bilevel optimization", None,
+    ),
 }
 
 
@@ -212,9 +444,28 @@ def applicability(problem: BenchmarkProblem | BilevelProblem, optimizer_name: st
     if optimizer_name not in OPTIMIZERS:
         return False, "unknown optimizer"
     if isinstance(problem, BilevelProblem):
-        return (optimizer_name == "nested_random", "true bilevel tasks require a nested method")
-    if optimizer_name == "nested_random":
-        return False, "nested_random is only for true bilevel tasks"
+        return (
+            optimizer_name in {"nested_random", "source_bilevel"},
+            "true bilevel tasks require a bilevel method",
+        )
+    if optimizer_name in {"nested_random", "source_bilevel"}:
+        return False, "bilevel optimizer is only for true bilevel tasks"
+    if optimizer_name == "smac_hpo":
+        return (problem.family == "yahpo", "SMAC HPO is reserved for YAHPO ConfigSpace tasks")
+    if optimizer_name == "ng_mixed_portfolio":
+        return (
+            problem.is_numeric_box and any(t != "continuous" for t in problem.variable_types),
+            "mixed portfolio requires a numeric mixed-variable box",
+        )
+    if optimizer_name == "tbpsa":
+        return (problem.is_numeric_box and problem.noisy, "TBPSA is selected for noisy numeric tasks")
+    if optimizer_name == "pymoo_isres":
+        return (
+            problem.is_numeric_box and problem.number_of_constraints > 0,
+            "ISRES requires explicit numeric inequality constraints",
+        )
+    if optimizer_name == "ngopt":
+        return (problem.is_numeric_box, "NGOpt requires a numeric box")
     if not problem.is_numeric_box:
         return (optimizer_name == "random_search", "categorical/hierarchical tasks require configuration sampling")
     if any(t != "continuous" for t in problem.variable_types):
@@ -239,4 +490,17 @@ def run_numeric_optimizer(
         spec.runner(objective, bounds, budget, seed)
     except BudgetExceeded:
         pass
+
+
+def run_problem_optimizer(
+    optimizer_name: str,
+    problem: BenchmarkProblem,
+    evaluate: ProblemEvaluator,
+    budget: int,
+    seed: int,
+) -> Any | None:
+    runner = OPTIMIZERS[optimizer_name].problem_runner
+    if runner is None:
+        raise ValueError(f"{optimizer_name} does not use the problem-aware runner.")
+    return runner(problem, evaluate, budget, seed)
 

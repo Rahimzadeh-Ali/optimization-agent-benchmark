@@ -1,7 +1,7 @@
 # Implementation status
 
 All 30 function-visible tasks from `optimization_agent_benchmark_suite.md` are
-registered. “Implemented” means the adapter/equation exists; an optional
+registered. "Implemented" means the adapter/equation exists; an optional
 backend must still be installed for rows that name one.
 
 | IDs | Count | Source/backend | Status |
@@ -19,18 +19,30 @@ backend must still be installed for rows that name one.
 | B01-B03 | 3 | Direct SMD equations | Implemented |
 | B04-B05 | 2 | Direct BOLIB equations/data | Implemented |
 
-## Function-aware methods
+## One SOTA optimizer per task
 
-The suite includes random search, scrambled Sobol, CMA-ES, differential
-evolution, GP Bayesian optimization, TuRBO, BOBYQA, Nelder-Mead, L-BFGS-B,
-and nested random search for true bilevel tasks. AI/LLM methods are deliberately
-outside the current scope.
+| Numbered scripts | IDs | Method |
+|---|---|---|
+| task001-task003 | D01-D03 | CMA-ES |
+| task004-task005 | D04-D05 | Nevergrad NGOpt |
+| task006-task008 | V01-V03 | Nevergrad PortfolioDiscreteOnePlusOne |
+| task009-task010 | V04-V05 | SMAC HPO |
+| task011-task015 | N01-N05 | Nevergrad TBPSA |
+| task016-task017 | S01-S02 | CMA-ES |
+| task018-task020 | S03-S05 | Nevergrad NGOpt |
+| task021-task025 | C01-C05 | pymoo ISRES |
+| task026-task030 | B01-B05 | Source-structured bilevel optimization |
+
+AI/LLM methods are deliberately outside the current scope. Each numbered
+module can be run with, for example,
+`python -m optbench.tasks.task001 --budget 2000`.
 
 ## Visualization
 
-`optbench plot` creates per-task convergence and final-performance figures plus
-a suite-level optimizer-rank heatmap. The figures use feasibility-first scoring
-and never compare raw objective magnitudes across different tasks.
+`optbench sota --budget 2000` runs all selected methods and creates per-task
+convergence/regret figures plus `iteration_vs_regret.png`. The figures use
+feasibility-first scoring and never compare raw objective magnitudes across
+different tasks.
 
 ## Definition of a completed campaign
 

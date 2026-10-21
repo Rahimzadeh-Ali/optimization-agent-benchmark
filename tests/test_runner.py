@@ -42,7 +42,6 @@ def test_auto_matrix_covers_every_task_without_loading_backends() -> None:
         *(f"C{i:02d}" for i in range(1, 6)),
         *(f"B{i:02d}" for i in range(1, 6)),
     }
-    assert all(
-        row["optimizer"] == ("nested_random" if row["problem_id"].startswith("B") else "random_search")
-        for row in plan
-    )
+    from optbench.sota import sota_method
+
+    assert all(row["optimizer"] == sota_method(row["problem_id"]).optimizer for row in plan)

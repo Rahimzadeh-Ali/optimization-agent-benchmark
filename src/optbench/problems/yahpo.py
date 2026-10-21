@@ -29,6 +29,12 @@ class YahpoProblem(BenchmarkProblem):
             self._bench.set_constant("trainsize", 1.0)
             self._bench.set_constant("repl", 1)
             self._space = self._bench.get_opt_space(drop_fidelity_params=True, seed=self.seed)
+            # YAHPO 1.0.2 calls a private ConfigSpace 0.6 sorting hook which
+            # was removed in ConfigSpace 1.x.  Modern SMAC needs ConfigSpace
+            # 1.x; its order is already stable, so the old hook is a no-op.
+            space_type = type(self._bench.config_space)
+            if not hasattr(space_type, "_sort_hyperparameters"):
+                setattr(space_type, "_sort_hyperparameters", lambda space: None)
         except Exception as exc:
             raise BackendUnavailable(
                 "YAHPO is installed but its v1.0.2 surrogate data are unavailable or misconfigured. "

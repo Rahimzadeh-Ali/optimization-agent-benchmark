@@ -11,8 +11,15 @@ from typing import Any, Mapping
 import numpy as np
 
 from optbench.base import BenchmarkProblem, BilevelProblem, EvaluationResult
-from optbench.optimizers import OPTIMIZERS, applicability, run_numeric_optimizer
+from optbench.optimizers import (
+    OPTIMIZERS,
+    applicability,
+    run_numeric_optimizer,
+    run_problem_optimizer,
+)
+from optbench.references import objective_reference
 from optbench.registry import PROBLEMS, create_problem
+from optbench.sota import sota_method
 
 
 def _jsonable(value: Any) -> Any:
@@ -88,7 +95,7 @@ def _run_single(
     started = time.perf_counter()
     best: tuple[Any, EvaluationResult] | None = None
 
-    def evaluate(candidate: Any) -> float:
+    def record(candidate: Any) -> EvaluationResult:
         nonlocal best
         if isinstance(candidate, np.ndarray) and problem.bounds is not None:
             candidate = _repair_numeric(problem, candidate)
@@ -105,16 +112,24 @@ def _run_single(
                 **result.to_dict(),
             },
         )
-        return _merit(result)
+        return result
 
+    def evaluate(candidate: Any) -> float:
+        return _merit(record(candidate))
+
+    recommendation: Any | None = None
     if optimizer == "random_search":
         rng = np.random.default_rng(seed)
         for _ in range(budget):
             evaluate(problem.sample(rng))
     else:
-        if problem.bounds is None:
-            raise TypeError(f"{optimizer} requires a numeric box.")
-        run_numeric_optimizer(optimizer, evaluate, problem.bounds, budget, seed)
+        spec = OPTIMIZERS[optimizer]
+        if spec.problem_runner is not None:
+            recommendation = run_problem_optimizer(optimizer, problem, record, budget, seed)
+        else:
+            if problem.bounds is None:
+                raise TypeError(f"{optimizer} requires a numeric box.")
+            run_numeric_optimizer(optimizer, evaluate, problem.bounds, budget, seed)
 
     optimization_evaluations = problem.evaluations
     validation: dict[str, Any] | None = None
@@ -124,15 +139,16 @@ def _run_single(
         problem.set_budget_limit(None)
         repeats = 20
         values: list[float] = []
+        validation_candidate = best[0] if recommendation is None else recommendation
         for repeat in range(repeats):
-            result = problem.evaluate(best[0])
+            result = problem.evaluate(validation_candidate)
             values.append(result.objective)
             _append_jsonl(
                 trace_path,
                 {
                     "phase": "validation",
                     "repeat": repeat + 1,
-                    "candidate": best[0],
+                    "candidate": validation_candidate,
                     **result.to_dict(),
                 },
             )
@@ -140,6 +156,7 @@ def _run_single(
             "repeats": repeats,
             "mean": float(np.mean(values)),
             "standard_deviation": float(np.std(values, ddof=1)),
+            "candidate": validation_candidate,
         }
 
     return {
@@ -152,11 +169,15 @@ def _run_single(
 
 def _run_bilevel(
     problem: BilevelProblem,
+    optimizer: str,
     seed: int,
     upper_budget: int,
     inner_budget: int,
     trace_path: Path,
 ) -> dict[str, Any]:
+    if optimizer == "source_bilevel":
+        return _run_source_bilevel(problem, seed, upper_budget, inner_budget, trace_path)
+
     problem.reset(seed)
     rng = np.random.default_rng(seed)
     started = time.perf_counter()
@@ -222,6 +243,154 @@ def _run_bilevel(
     }
 
 
+def _run_source_bilevel(
+    problem: BilevelProblem,
+    seed: int,
+    upper_budget: int,
+    inner_budget: int,
+    trace_path: Path,
+) -> dict[str, Any]:
+    """BLEAQ-II-style leader search with the strongest available follower solver."""
+    from scipy.optimize import minimize
+
+    problem.reset(seed)
+    rng = np.random.default_rng(seed)
+    started = time.perf_counter()
+    outer_index = 0
+    best: tuple[np.ndarray, np.ndarray, EvaluationResult, dict[str, Any]] | None = None
+
+    def solve_follower(xu: np.ndarray, current_outer: int) -> tuple[np.ndarray, EvaluationResult]:
+        # SMD publishes the exact lower-level optimal mapping. Using it is the
+        # source-provided plug-and-play follower model used by BLEAQ-II tests.
+        if hasattr(problem, "analytic_lower_response"):
+            xl = np.asarray(problem.analytic_lower_response(xu), dtype=float)
+            lower = problem.evaluate_lower(xu, xl)
+            _append_jsonl(
+                trace_path,
+                {
+                    "phase": "lower_optimization",
+                    "outer_evaluation": current_outer,
+                    "inner_evaluation": 1,
+                    "method": "published_analytic_follower",
+                    "xu": xu,
+                    "xl": xl,
+                    **lower.to_dict(),
+                },
+            )
+            return xl, lower
+
+        evaluated: list[tuple[np.ndarray, EvaluationResult]] = []
+
+        def lower_objective(xl: np.ndarray) -> float:
+            if len(evaluated) >= inner_budget:
+                return 1.0e15
+            candidate = np.clip(
+                np.asarray(xl, dtype=float),
+                problem.lower_bounds[:, 0],
+                problem.lower_bounds[:, 1],
+            )
+            result = problem.evaluate_lower(xu, candidate)
+            evaluated.append((candidate.copy(), result))
+            _append_jsonl(
+                trace_path,
+                {
+                    "phase": "lower_optimization",
+                    "outer_evaluation": current_outer,
+                    "inner_evaluation": len(evaluated),
+                    "method": "slsqp_follower",
+                    "xu": xu,
+                    "xl": candidate,
+                    **result.to_dict(),
+                },
+            )
+            return _merit(result)
+
+        def lower_feasibility(raw_xl: np.ndarray) -> np.ndarray:
+            candidate = np.clip(
+                np.asarray(raw_xl, dtype=float),
+                problem.lower_bounds[:, 0],
+                problem.lower_bounds[:, 1],
+            )
+            return -np.asarray(problem.lower_constraints(xu, candidate), dtype=float)
+
+        constraints = {
+            "type": "ineq",
+            "fun": lower_feasibility,
+        }
+        starts = [
+            np.mean(problem.lower_bounds, axis=1),
+            rng.uniform(problem.lower_bounds[:, 0], problem.lower_bounds[:, 1]),
+        ]
+        allocation = max(1, inner_budget // len(starts))
+        for start in starts:
+            if len(evaluated) >= inner_budget:
+                break
+            minimize(
+                lower_objective,
+                start,
+                method="SLSQP",
+                bounds=[tuple(row) for row in problem.lower_bounds],
+                constraints=constraints,
+                options={"maxiter": allocation, "ftol": 1.0e-10, "disp": False},
+            )
+        if not evaluated:
+            raise RuntimeError("Follower optimizer produced no evaluations.")
+        feasible = [item for item in evaluated if item[1].feasible]
+        pool = feasible or evaluated
+        return min(pool, key=lambda item: _quality(item[1]))
+
+    def leader_objective(raw_xu: np.ndarray) -> float:
+        nonlocal outer_index, best
+        xu = np.clip(
+            np.asarray(raw_xu, dtype=float),
+            problem.upper_bounds[:, 0],
+            problem.upper_bounds[:, 1],
+        )
+        outer_index += 1
+        xl, lower = solve_follower(xu, outer_index)
+        upper = problem.evaluate_upper(xu, xl)
+        validation = problem.validate_lower_solution(xu, xl)
+        _append_jsonl(
+            trace_path,
+            {
+                "phase": "upper_evaluation",
+                "upper_evaluation": outer_index,
+                "method": "cma_es_leader",
+                "xu": xu,
+                "xl": xl,
+                "lower_incumbent": lower.to_dict(),
+                "lower_validation": validation,
+                **upper.to_dict(),
+            },
+        )
+        candidate = (xu.copy(), xl.copy(), upper, validation)
+        if best is None:
+            best = candidate
+        else:
+            candidate_key = (not bool(validation["valid"]),) + _quality(upper)
+            best_key = (not bool(best[3]["valid"]),) + _quality(best[2])
+            if candidate_key < best_key:
+                best = candidate
+        if not validation["valid"]:
+            return 1.0e12 + 1.0e6 * float(validation.get("optimality_gap", 1.0))
+        return _merit(upper)
+
+    run_numeric_optimizer("cma_es", leader_objective, problem.upper_bounds, upper_budget, seed)
+    return {
+        "upper_evaluations": problem.upper_evaluations,
+        "lower_evaluations": problem.lower_evaluations,
+        "best": None
+        if best is None
+        else {
+            "xu": best[0],
+            "xl": best[1],
+            **best[2].to_dict(),
+            "lower_validation": best[3],
+        },
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
 def run_campaign(
     problem_id: str,
     optimizer: str,
@@ -241,6 +410,8 @@ def run_campaign(
     run_id, run_dir = _make_run_dir(output_root, problem_id, optimizer, seed)
     trace_path = run_dir / "trace.jsonl"
     started_at = datetime.now(timezone.utc).isoformat()
+    selected_budget: int | None = None
+    selected_inner: int | None = None
     try:
         problem = create_problem(problem_id, seed=seed)
         allowed, reason = applicability(problem, optimizer)
@@ -254,7 +425,7 @@ def run_campaign(
             )
             if selected_budget < 1 or selected_inner < 1:
                 raise ValueError("Both bilevel budgets must be positive.")
-            result = _run_bilevel(problem, seed, selected_budget, selected_inner, trace_path)
+            result = _run_bilevel(problem, optimizer, seed, selected_budget, selected_inner, trace_path)
             status = "completed"
         else:
             selected_budget = problem.budget if budget is None else int(budget)
@@ -284,9 +455,15 @@ def run_campaign(
         "optimizer": optimizer,
         "seed": seed,
         "status": status,
+        "budget_limit": selected_budget,
+        "inner_budget_limit": selected_inner,
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "task": problem.agent_spec(),
+        "sota_method": sota_method(problem_id).to_dict()
+        if optimizer == sota_method(problem_id).optimizer
+        else None,
+        "regret_reference": objective_reference(problem).to_dict(),
         "result": result,
         "versions": _versions(),
         "artifacts": {"trace": "trace.jsonl", "summary": "summary.json"},
@@ -312,11 +489,7 @@ def build_matrix_plan(
         for requested_optimizer in selected_optimizers:
             optimizer = requested_optimizer
             if optimizer == "auto":
-                optimizer = (
-                    "nested_random"
-                    if PROBLEMS[problem_id].direction == "true_bilevel"
-                    else "random_search"
-                )
+                optimizer = sota_method(problem_id).optimizer
             if optimizer not in OPTIMIZERS:
                 raise KeyError(f"Unknown optimizer {optimizer!r}.")
             for seed in selected_seeds:

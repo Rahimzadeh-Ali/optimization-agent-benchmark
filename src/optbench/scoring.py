@@ -6,7 +6,10 @@ from typing import Any, Iterable
 
 
 def load_summaries(root: str | Path) -> list[dict[str, Any]]:
-    return [json.loads(path.read_text(encoding="utf-8")) for path in Path(root).rglob("summary.json")]
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(Path(root).rglob("summary.json"))
+    ]
 
 
 def rank_completed(summaries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
