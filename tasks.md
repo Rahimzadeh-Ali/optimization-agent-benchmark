@@ -40,9 +40,11 @@ module can be run with, for example,
 ## Visualization
 
 `optbench sota --budget 2000` runs all selected methods and creates per-task
-convergence/regret figures plus `iteration_vs_regret.png`. The figures use
-feasibility-first scoring and never compare raw objective magnitudes across
-different tasks.
+convergence and task-valid optimization profiles plus `iteration_profiles.png`.
+The profile metric is exact regret only when a trustworthy optimum exists;
+otherwise it is explicitly labelled as objective, signed empirical gap, noisy
+rolling median, or constraint violation. Raw magnitudes are never compared
+across different tasks.
 
 ## Definition of a completed campaign
 

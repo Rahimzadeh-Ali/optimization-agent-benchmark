@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -38,6 +39,15 @@ class RunArtifact:
     def trace_path(self) -> Path:
         relative = self.summary.get("artifacts", {}).get("trace", "trace.jsonl")
         return self.summary_path.parent / relative
+
+
+@dataclass(frozen=True)
+class ProfileTrajectory:
+    indices: np.ndarray
+    values: np.ndarray
+    metric: str
+    reference_kind: str
+    note: str
 
 
 def _matplotlib():
@@ -172,19 +182,121 @@ def _trajectory(run: RunArtifact) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return np.asarray(indices), np.asarray(objectives), np.asarray(violations)
 
 
-def _regret_trajectory(run: RunArtifact) -> tuple[np.ndarray, np.ndarray, str]:
+def _rolling_noisy_observations(
+    run: RunArtifact, window: int = 51
+) -> tuple[np.ndarray, np.ndarray]:
+    points: list[tuple[int, float]] = []
+    for row in _read_jsonl(run.trace_path):
+        if row.get("phase") == "optimization":
+            index = int(row["evaluation"])
+        elif row.get("phase") == "upper_evaluation":
+            index = int(row["upper_evaluation"])
+        else:
+            continue
+        if _valid_result(row) and np.isfinite(float(row["objective"])):
+            points.append((index, float(row["objective"])))
+    points.sort(key=lambda item: item[0])
+    if not points:
+        return np.asarray([]), np.asarray([])
+    indices = np.asarray([item[0] for item in points])
+    observations = np.asarray([item[1] for item in points])
+    medians = np.asarray(
+        [np.median(observations[max(0, i - window + 1) : i + 1]) for i in range(len(points))]
+    )
+    return indices, medians
+
+
+def _profile_trajectory(run: RunArtifact) -> ProfileTrajectory:
     indices, objectives, _ = _trajectory(run)
+    task = run.summary.get("task", {})
+    if bool(task.get("noisy", False)):
+        noisy_indices, noisy_values = _rolling_noisy_observations(run)
+        return ProfileTrajectory(
+            noisy_indices,
+            noisy_values,
+            "Rolling median observed objective",
+            "noisy_observations",
+            "Trailing median over 51 evaluations; not best-sample regret",
+        )
+
+    finite_objectives = objectives[np.isfinite(objectives)]
+    if not len(finite_objectives):
+        _, _, violations = _trajectory(run)
+        return ProfileTrajectory(
+            indices,
+            violations,
+            "Best constraint violation",
+            "no_feasible_point",
+            "No feasible objective was observed",
+        )
+
     reference_data = run.summary.get("regret_reference", {})
     reference = reference_data.get("objective")
     kind = str(reference_data.get("kind", "run_best"))
-    if reference is None:
-        finite = objectives[np.isfinite(objectives)]
-        reference = float(np.min(finite)) if len(finite) else 0.0
-        kind = "run_best"
-    regrets = objectives - float(reference)
-    # Numerical noise and stochastic observations may cross a latent reference.
-    regrets = np.where(np.isfinite(regrets), np.maximum(regrets, 1.0e-12), np.nan)
-    return indices, regrets, kind
+    if reference is None or kind in {"run_best", "noisy_validation_required"}:
+        return ProfileTrajectory(
+            indices,
+            objectives,
+            "Best valid objective",
+            kind,
+            "No trustworthy external optimum is available; objective is shown instead of regret",
+        )
+
+    gaps = objectives - float(reference)
+    finite_gaps = gaps[np.isfinite(gaps)]
+    tolerance = max(1.0e-12, 1.0e-10 * max(1.0, abs(float(reference))))
+    empirical = kind.startswith("empirical")
+    inconsistent = bool(len(finite_gaps) and np.min(finite_gaps) < -tolerance)
+    if empirical:
+        return ProfileTrajectory(
+            indices,
+            gaps,
+            "Signed gap to empirical reference",
+            kind,
+            "Negative values mean the campaign improved on the empirical reference",
+        )
+    if inconsistent:
+        return ProfileTrajectory(
+            indices,
+            gaps,
+            "Signed gap to inconsistent reference",
+            kind,
+            "A value below a claimed exact optimum indicates a benchmark/reference mismatch",
+        )
+
+    regrets = np.where(np.isfinite(gaps), np.maximum(gaps, 0.0), np.nan)
+    return ProfileTrajectory(
+        indices,
+        regrets,
+        "Best feasible regret",
+        kind,
+        "Zero is displayed at zero; values are never replaced by an artificial floor",
+    )
+
+
+def _set_profile_scale(axis: Any, arrays: Iterable[np.ndarray]) -> None:
+    finite_parts = [values[np.isfinite(values)] for values in arrays]
+    finite_parts = [values for values in finite_parts if len(values)]
+    if not finite_parts:
+        return
+    values = np.concatenate(finite_parts)
+    nonzero = np.abs(values[values != 0.0])
+    if np.any(values <= 0.0):
+        linthresh = max(float(np.min(nonzero)) * 0.1, 1.0e-15) if len(nonzero) else 1.0
+        axis.set_yscale("symlog", linthresh=linthresh)
+    else:
+        axis.set_yscale("log")
+
+
+def _short_metric(metric: str) -> str:
+    return {
+        "Best feasible regret": "exact regret",
+        "Best valid objective": "best objective",
+        "Rolling median observed objective": "noisy rolling median",
+        "Best constraint violation": "constraint violation",
+        "Signed gap to empirical reference": "signed empirical gap",
+        "Signed gap to inconsistent reference": "reference mismatch",
+    }.get(metric, metric.lower())
 
 
 def _aggregate_series(
@@ -304,16 +416,24 @@ def plot_problem_regret(runs: list[RunArtifact], output: Path) -> None:
     problem_id = str(runs[0].summary["problem_id"])
     figure, axis = plt.subplots(figsize=(10.5, 5.8), dpi=150)
     kinds: set[str] = set()
-    any_regret = False
+    metrics: set[str] = set()
+    notes: set[str] = set()
+    plotted_values: list[np.ndarray] = []
+    any_profile = False
     for color_index, (optimizer, optimizer_runs) in enumerate(_group_by_optimizer(runs).items()):
         color = PALETTE[color_index % len(PALETTE)]
-        trajectories = [_regret_trajectory(run) for run in optimizer_runs]
-        kinds.update(item[2] for item in trajectories)
-        max_index = max((int(item[0][-1]) for item in trajectories if len(item[0])), default=0)
+        trajectories = [_profile_trajectory(run) for run in optimizer_runs]
+        kinds.update(item.reference_kind for item in trajectories)
+        metrics.update(item.metric for item in trajectories)
+        notes.update(item.note for item in trajectories)
+        max_index = max(
+            (int(item.indices[-1]) for item in trajectories if len(item.indices)),
+            default=0,
+        )
         matrix = np.full((len(trajectories), max_index), np.nan)
-        for row, (indices, regrets, _) in enumerate(trajectories):
-            if len(indices):
-                matrix[row, indices.astype(int) - 1] = regrets
+        for row, trajectory in enumerate(trajectories):
+            if len(trajectory.indices):
+                matrix[row, trajectory.indices.astype(int) - 1] = trajectory.values
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             median = np.nanmedian(matrix, axis=0)
@@ -322,7 +442,8 @@ def plot_problem_regret(runs: list[RunArtifact], output: Path) -> None:
         x = np.arange(1, max_index + 1)
         finite = np.isfinite(median)
         if finite.any():
-            any_regret = True
+            any_profile = True
+            plotted_values.append(median[finite])
             axis.plot(x[finite], median[finite], color=color, linewidth=2.0, label=optimizer)
         axis.fill_between(
             x,
@@ -333,21 +454,22 @@ def plot_problem_regret(runs: list[RunArtifact], output: Path) -> None:
             alpha=0.14,
             linewidth=0,
         )
-    if any_regret:
-        axis.set_yscale("log")
+    if any_profile:
+        _set_profile_scale(axis, plotted_values)
     else:
         axis.text(
             0.5,
             0.5,
-            "No feasible regret trajectory was observed.",
+            "No valid optimization profile was observed.",
             transform=axis.transAxes,
             ha="center",
             va="center",
             color=TEXT_MUTED,
         )
     axis.set_xlabel("Evaluation")
-    axis.set_ylabel("Best feasible regret")
-    axis.set_title(f"{problem_id}: iteration vs regret", loc="left", fontsize=13, pad=12)
+    metric_label = " / ".join(sorted(metrics)) if metrics else "Task-valid metric"
+    axis.set_ylabel(metric_label)
+    axis.set_title(f"{problem_id}: optimization profile", loc="left", fontsize=13, pad=12)
     handles, labels = axis.get_legend_handles_labels()
     if handles:
         axis.legend(handles, labels, frameon=False)
@@ -355,7 +477,7 @@ def plot_problem_regret(runs: list[RunArtifact], output: Path) -> None:
     figure.text(
         0.01,
         0.01,
-        "Reference type: " + ", ".join(sorted(kinds)) + ". Regret is clipped at 1e-12 for log display.",
+        "Reference type: " + ", ".join(sorted(kinds)) + ". " + " ".join(sorted(notes)),
         fontsize=8,
         color=TEXT_MUTED,
     )
@@ -372,15 +494,20 @@ def plot_suite_regret_dashboard(
     figure, axes = plt.subplots(6, 5, figsize=(18, 19), dpi=150)
     for axis, problem_id in zip(axes.flat, ordered):
         runs = by_problem[problem_id]
-        any_regret = False
+        any_profile = False
+        panel_values: list[np.ndarray] = []
+        panel_metrics: set[str] = set()
         for color_index, (optimizer, optimizer_runs) in enumerate(_group_by_optimizer(runs).items()):
             color = PALETTE[color_index % len(PALETTE)]
             for run in optimizer_runs:
-                x, regret, _ = _regret_trajectory(run)
-                finite = np.isfinite(regret)
+                trajectory = _profile_trajectory(run)
+                x, values = trajectory.indices, trajectory.values
+                panel_metrics.add(trajectory.metric)
+                finite = np.isfinite(values)
                 if finite.any():
-                    any_regret = True
-                    axis.plot(x[finite], regret[finite], color=color, linewidth=1.35, alpha=0.9)
+                    any_profile = True
+                    panel_values.append(values[finite])
+                    axis.plot(x[finite], values[finite], color=color, linewidth=1.35, alpha=0.9)
             axis.text(
                 0.98,
                 0.96,
@@ -391,17 +518,28 @@ def plot_suite_regret_dashboard(
                 fontsize=6.5,
                 color=TEXT_MUTED,
             )
-        if any_regret:
-            axis.set_yscale("log")
+        if any_profile:
+            _set_profile_scale(axis, panel_values)
         else:
             axis.text(
                 0.5,
                 0.5,
-                "No valid\nregret",
+                "No valid\nprofile",
                 transform=axis.transAxes,
                 ha="center",
                 va="center",
                 fontsize=7,
+                color=TEXT_MUTED,
+            )
+        if panel_metrics:
+            axis.text(
+                0.02,
+                0.04,
+                " / ".join(_short_metric(metric) for metric in sorted(panel_metrics)),
+                transform=axis.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=6.2,
                 color=TEXT_MUTED,
             )
         axis.set_title(problem_id, loc="left", fontsize=10, pad=4)
@@ -410,8 +548,8 @@ def plot_suite_regret_dashboard(
     for axis in axes[-1, :]:
         axis.set_xlabel("Evaluation", fontsize=8)
     for axis in axes[:, 0]:
-        axis.set_ylabel("Regret", fontsize=8)
-    figure.suptitle("SOTA optimizer profiles: iteration versus regret", fontsize=17, y=0.995)
+        axis.set_ylabel("Task-valid metric", fontsize=8)
+    figure.suptitle("SOTA optimizer profiles: evaluation versus task-valid metric", fontsize=17, y=0.995)
     figure.tight_layout(rect=(0, 0, 1, 0.988))
     figure.savefig(output, bbox_inches="tight")
     plt.close(figure)
@@ -587,19 +725,23 @@ def visualize_results(
         problem_dir = output_root / problem_id
         problem_dir.mkdir(parents=True, exist_ok=True)
         convergence = problem_dir / "convergence.png"
-        regret = problem_dir / "regret_profile.png"
+        profile = problem_dir / "optimization_profile.png"
+        legacy_regret = problem_dir / "regret_profile.png"
         final = problem_dir / "final_performance.png"
         plot_problem_convergence(by_problem[problem_id], convergence)
-        plot_problem_regret(by_problem[problem_id], regret)
+        plot_problem_regret(by_problem[problem_id], profile)
+        shutil.copyfile(profile, legacy_regret)
         plot_problem_final(by_problem[problem_id], final)
-        generated.extend([str(convergence), str(regret), str(final)])
+        generated.extend([str(convergence), str(profile), str(legacy_regret), str(final)])
 
     heatmap = output_root / "suite_rank_heatmap.png"
     plot_suite_rank_heatmap(selected, heatmap)
     generated.append(str(heatmap))
-    dashboard = output_root / "iteration_vs_regret.png"
+    dashboard = output_root / "iteration_profiles.png"
+    legacy_dashboard = output_root / "iteration_vs_regret.png"
     plot_suite_regret_dashboard(by_problem, dashboard)
-    generated.append(str(dashboard))
+    shutil.copyfile(dashboard, legacy_dashboard)
+    generated.extend([str(dashboard), str(legacy_dashboard)])
     manifest = {
         "input_root": str(Path(input_root).resolve()),
         "output_root": str(output_root),
@@ -612,7 +754,14 @@ def visualize_results(
             "objective": "best feasible and lower-level-valid objective",
             "aggregation": "median and interquartile range across seeds",
             "suite_comparison": "within-task ranks; raw objectives are never compared across tasks",
-            "regret": "best valid objective minus exact, published, empirical, or run-best reference",
+            "profile_metric_policy": {
+                "exact_reference": "nonnegative best-feasible regret, with zero retained",
+                "empirical_reference": "signed gap; negative means the reference was improved",
+                "unknown_reference": "best valid objective; never self-referenced regret",
+                "noisy_task": "51-evaluation trailing median of observations; never best noisy sample",
+                "no_feasible_point": "best total constraint violation",
+                "inconsistent_exact_reference": "signed gap labelled as a reference mismatch",
+            },
         },
     }
     manifest_path = output_root / "plot_manifest.json"

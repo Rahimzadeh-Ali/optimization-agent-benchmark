@@ -26,7 +26,11 @@ def objective_reference(problem: BenchmarkProblem | BilevelProblem) -> Objective
     if problem_id in {"S04", "S05"}:
         return ObjectiveReference(float(problem.bias), "defined_global", "CEC task bias at the hidden shift point")
     if problem_id in {"N04", "N05"}:
-        return ObjectiveReference(0.0, "latent_global", "Noiseless Nevergrad base-function optimum")
+        return ObjectiveReference(
+            None,
+            "noisy_validation_required",
+            "A noiseless optimum is not a valid reference for individual noisy observations",
+        )
     if problem_id in {"C04", "C05"}:
         front = np.asarray(problem._problem.pareto_front(), dtype=float).reshape(-1)
         return ObjectiveReference(float(front[0]), "published_global", "pymoo reference optimum")

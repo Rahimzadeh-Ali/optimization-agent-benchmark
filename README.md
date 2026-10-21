@@ -23,8 +23,8 @@ callable objective (and constraints where appropriate), matching the ordinary
   plus the older baselines for controlled comparisons.
 - Pinned problem-backend versions so benchmark definitions do not drift when
   a dependency publishes a new release.
-- GitHub-style benchmark visualization: convergence curves, iteration-versus-
-  regret profiles, final-performance bars, and a cross-suite dashboard.
+- GitHub-style benchmark visualization: scientifically labelled optimization
+  profiles, final-performance bars, and a cross-suite dashboard.
 
 ## Install
 
@@ -76,7 +76,7 @@ optbench run --problem B01 --optimizer nested_random --seed 0 --budget 4 --inner
 optbench matrix --optimizers auto --seeds 0
 
 # Run all 30 selected SOTA methods with the requested maximum budget and then
-# generate the iteration-versus-regret figures.
+# generate task-valid optimization profiles.
 optbench sota --budget 2000 --inner-budget 100
 
 # Resume safely after an interruption; completed 2,000-evaluation runs are skipped.
@@ -99,19 +99,19 @@ Results are written under `results/raw/<run_id>/` as `trace.jsonl` and
 `summary.json`. Every objective query is retained.
 
 The `sota` workflow writes production results under `results/sota/raw/`, the
-dashboard to `results/sota/figures/iteration_vs_regret.png`, and a completion
+dashboard to `results/sota/figures/iteration_profiles.png`, and a completion
 record to `results/sota/sota_manifest.json`.
 
 ## Completed 2,000-evaluation campaign
 
-![Iteration versus regret for all 30 tasks](results/sota/figures/iteration_vs_regret.png)
+![Optimization profiles for all 30 tasks](results/sota/figures/iteration_profiles.png)
 
 The checked campaign completed all 30 tasks with zero execution failures.
 Twenty-five tasks used the full 2,000-evaluation allowance; B01-B04 and S01
 stopped earlier under their optimizer termination criteria. C05 (pymoo G7)
-did not find a feasible point at seed 0 within the allowance, so its panel
-correctly reports `No valid regret` instead of treating an infeasible objective
-as a successful result.
+did not find a feasible point at seed 0 within the allowance, so its panel plots
+best constraint violation instead of treating an infeasible objective as a
+successful result.
 
 ## One SOTA method per task
 
@@ -148,8 +148,11 @@ suite:
   as if it were successful.
 - `suite_rank_heatmap.png` compares within-task ranks. Raw objective values are
   never compared across unrelated task families.
-- `regret_profile.png` plots best feasible regret against evaluation for one
-  task; `iteration_vs_regret.png` places all 30 profiles in one dashboard.
+- `optimization_profile.png` selects the scientifically valid metric for each
+  task: exact regret, signed empirical gap, best objective, a rolling noisy
+  objective, or constraint violation. `iteration_profiles.png` places all 30
+  profiles in one dashboard. The older regret filenames remain compatibility
+  copies.
 - `plot_manifest.json` records exactly which runs and semantics produced the
   figures.
 
